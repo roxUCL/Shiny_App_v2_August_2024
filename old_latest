@@ -1,0 +1,755 @@
+
+# TEsting Version of Shiny app for EPICv2 array
+
+library(shiny)
+library(shinyjs)
+library(shinyjqui)
+library(htmlwidgets)
+library(shinydashboard)
+library(dplyr)
+library(glue)
+library(shinyauthr)
+library(RSQLite)
+library(DBI)
+library(lubridate)
+library(config)
+library(DT)
+library(pdftools)
+library(shinyalert)
+library(shinyWidgets)
+library(shinyBS)
+library(tidyverse)
+
+mytitle <- paste0("DoN/NHNN Methylation Analyses")
+version<-"v2.0"
+
+# version v2.0 Rossella Rispoli
+#
+
+#This version has a modified way to save csv input files: 1 for batches, such as 1:8 entry per files. With a files name equal to joib_ID_b{1...N}
+long_text <- htmltools::HTML("By choising the EPIC_pipeline version 1/2 will be possible to access to the analysis report, if available,<br> obtained with differet versions of the DKFZ classifier.<br><b>EPIC_piepeline_v1:</b><br> sarc_v12b6,<br>mnp_v11b6,<br> mnp_v11b4,<br> mnp_v12b6,<br> KIAA1549_BRAF_Fusion_v1.0,<br> MEpurity_v0.1,<br> QC_v1,<br> Astrocytomas_v0.<br><b>EPIC_piepeline_v2:</b><br> sarc_v12b8,<br> mnp_v12b8,<br> KIAA1549_BRAF_Fusion_v1.0,<br> MEpurity_v0.1,<br> QC_v1,Astrocytomas_v0")
+
+# Defaults
+
+blank_list = ""
+default_pipelines = c("mnp_v12b6","MEpurity_v0.1")
+#if(chip==""){
+#default_pipelines = c("mnp_v12b6","MEpurity_v0.1")
+#}else{
+#  default_pipelines = c("mnp_v12EPICv2","Quality")
+#}
+df_completed_job = NULL
+# Remove pipelines without a report
+remove_pipelines = c("Scan_Date")
+version="v2"
+
+#according to the version the s_drive directory and the pipeline index change 
+#remember to update this variable with the Epic_pipeline_version once the app is in running mode
+
+if(version=="v2"){
+  pipeline_index=c(8,10,12,14,16,18,20,22)
+  root_s_drive_dir = "~/Documents/UCL/Projects/Epicv2_analysis/ShinyApp_v2.0/testing_out_last_run_v2/"
+}else{
+  pipeline_index=c(8,10,12,14,16,18,20,22,24,26)
+  root_s_drive_dir = "~/Documents/UCL/Projects/Epicv2_analysis/ShinyApp_v2.0/testing_out_last_run_v1/"
+}
+# Directories
+
+#
+# Production
+#
+#root_s_drive_dir = "/home/docker/output"
+#
+# Testing outside docker
+#
+  #testing = F
+  #  if (testing) {
+  #  #root_s_drive_dir='/home/skgta37/Projects/Methylation_Batch_Pipelines/output/'
+  #  root_s_drive_dir = "/media/IoN_NP_Neurolab/Molecular Pathology/Illumina/.Automated_Pipelines"
+  #}
+
+#
+# General
+#
+submit_job_dir = file.path(root_s_drive_dir,"new_jobs")
+active_job_dir = file.path(root_s_drive_dir,"queued_jobs")
+completed_job_dir = file.path(root_s_drive_dir,"completed_jobs")
+completed_collated_jobs = file.path(completed_job_dir,"all_completed_jobs.csv")
+report_record_dir = file.path(root_s_drive_dir,"collated_reports")
+
+print("Hello Shinyapp Debugging version******")
+
+#
+# Pipeline report paths
+#
+result_dirs = config::get("result_dirs", file="config.yml")
+classifier_reports_dirs = vector(mode="list")
+for (r in 1:length(result_dirs))
+  classifier_reports_dirs[names(result_dirs)[r]] = file.path(root_s_drive_dir,result_dirs[r])
+
+print(classifier_reports_dirs)
+# How many days should sessions last?
+cookie_expiry = 1
+
+#
+# Set-up login/passwd
+#
+get_sessions_from_db <- function(conn = db, expiry = cookie_expiry) {
+  dbReadTable(conn, "sessions") %>%
+    mutate(login_time = ymd_hms(login_time)) %>%
+    as_tibble() %>%
+    filter(login_time > now() - days(expiry))
+}
+# This function must accept two parameters: user and sessionid. It will be called whenever the user
+# successfully logs in with a password.
+add_session_to_db <- function(user, sessionid, conn = db) {
+  tibble(user = user, sessionid = sessionid, login_time = as.character(now())) %>%
+    dbWriteTable(conn, "sessions", ., append = TRUE)
+}
+db <- dbConnect(SQLite(), ":memory:")
+dbCreateTable(db, "sessions", c(user = "TEXT", sessionid = "TEXT", login_time = "TEXT"))
+users = config::get("users",file="config.yml")
+pwds = config::get("workspace",file="config.yml")
+perms = config::get("perms",file="config.yml")
+user_base <- tibble(
+  user = unlist(users),
+  password = unlist(pwds),
+  password_hash = sapply(unlist(pwds), sodium::password_store),
+  permissions = unlist(perms),
+  name = unlist(users)
+)
+remove(pwds)
+#
+#
+#
+
+
+######### DASHBOARD
+#########
+#########
+
+
+ui <- dashboardPage(
+  dashboardHeader(
+    title = paste("DoN/NHNN Methylation Array Results",version), titleWidth = 450,
+    tags$li(class = "dropdown", style = "padding: 8px;", shinyauthr::logoutUI("logout"))
+  ),
+  dashboardSidebar(
+    collapsed = TRUE,
+    div(textOutput("welcome"), style = "padding: 20px"),
+    sidebarMenuOutput("sidebar")
+  ),
+  dashboardBody(
+    shinyauthr::loginUI(
+      "login",
+      cookie_expiry = cookie_expiry ,
+      additional_ui = tagList(
+        tags$h4("DoN/NHNN Login.", class = "text-center")
+      )
+    ),
+    # Tab pages required after login
+    tabItems(
+      # Pipeline results
+      tabItem("tab1",
+              fluidRow(
+                sidebarLayout(
+
+                  sidebarPanel(width = 3,
+                               tags$div(style="display:inline-block",title="Update newly completed jobs.",
+                                        shiny::actionButton(inputId = "update_pipelines", label=HTML("<b style='color:white'>Update Database</b>"), class = "btn-primary btn-sm", style='padding:3px; font-size:100%; float:centre'),
+                               ),
+                               tags$br(),
+                               tags$br(),
+                               shiny::selectInput(inputId = "sample_id", label="Sample_ID", choices = c("",isolate(df_completed_job)$Sample_ID),multiple = F, selected = NULL),
+                               shiny::selectInput(inputId = "Epic_pipeline_version", label = tags$span("Epic_pipeline_version", bsButton("thisworks", label = "", icon = icon("info"), style = "info", size = "extra-small")), choices = c("","EPIC_pipeline_v1","EPIC_pipeline_v2"),multiple = F, selected = NULL),
+                               bsPopover(
+                                 id = "thisworks",
+                                 title = "More information",
+                                 content = long_text,
+                                 placement = "right",
+                                 trigger = "hover",
+                                 options = list(container = "body")
+                               ),
+                               tags$div(style="display:inline-block",title="Open NZConnect search for Sample_ID.",
+                                        shiny::actionButton(inputId = "nzconnect", label=HTML("<b style='color:white'>Search NZConnect</b>"), class = "btn-primary btn-sm", style='padding:3px; font-size:100%; float:centre'),
+                               ),
+                               tags$br(),
+                               tags$br(),
+                               box(id = "view_box",title = "View Report", width = NULL, status = "primary", solidHeader = T,
+
+                                   shiny::selectInput(inputId = "sentrix_id", label="Sentrix_ID", choices = blank_list,multiple = F,selectize = F, size=2),
+                                   shiny::selectInput(inputId = "job_id", label="Job_ID", choices = blank_list,multiple = F,selectize = F, size=2),
+                                   shiny::selectInput(inputId = "scan_date", label="Scan Date (DD/MM/YYYY)", choices = blank_list,multiple = F,selectize = F, size=1),
+                                   shiny::selectInput(inputId = "qc_status", label="QC Status", choices = blank_list,multiple = F,selectize = F, size=1),
+                                   shiny::selectInput(inputId = "AV", label = "Array_version",choices = blank_list,multiple = F,selectize = F,size=1),
+                                   shiny::selectInput(inputId = "pipelines", label="View Pipeline", choices = "",multiple = F,selectize = F, size=8),
+                               ),
+
+                               box(id = "report_box",title = "Build Composite Report", width = NULL, status = "primary", solidHeader = T,
+                                   orderInput('avaliable_reports', 'Omitted Reports', items = NULL, connect = 'pipelines_to_report',width="150px"),
+                                   tags$br(),
+                                   orderInput('pipelines_to_report', 'Included Reports', items = NULL, connect = 'avaliable_reports',width="150px"),
+                                   tags$br(),
+                                   tags$br(),
+                                   downloadButton('downloadData', 'Build and Download', style='padding:3px; font-size:120%; float:left')
+                               ),
+                               tags$br()
+                  ),
+
+                  mainPanel(width=9,
+                            uiOutput("pdfview")
+                  )
+                )
+              )
+      ),
+      # Completed Jobs
+      tabItem("tab2",
+              shiny::actionButton(inputId = "update_complete_queue", label="Update", class = "btn-primary btn-lg"),
+              uiOutput("tab2_ui")),
+      # Active/Queued Jobs
+      tabItem("tab3",
+              shiny::actionButton(inputId = "update_queue", label="Update", class = "btn-primary btn-lg"),
+              uiOutput("tab3_ui")),
+      # Submit a Job
+      tabItem("tab4",
+              shiny::textAreaInput("input_text",label = "Paste data here",value="",width = "400px",height = "200px"),
+              shiny::selectInput(inputId = "Epic_pipeline_version_sj", label="Epic_pipeline_version", choices = c("","EPIC_pipeline_v1","EPIC_pipeline_v2"),multiple = F, selected = NULL),
+              shinyjs::disabled(shiny::actionButton(inputId = "submit_job", label="Submit Job", class = "btn-primary btn-lg")),
+              uiOutput("tab4_ui")),
+      # Blank tab
+      tabItem("tab5")),
+
+    uiOutput("ui_open_tab")
+  )
+)
+
+
+#########
+#########
+######### SERVER
+#########
+#########
+
+server <- function(input, output, session) {
+  rv <- reactiveValues()
+  # get common date_stamp
+  rv$date_stamp = format(Sys.time(),format="%Y%m%d_%H%M%S")
+
+  # call login module supplying data frame, user and password cols and reactive trigger
+  credentials <- shinyauthr::loginServer(
+    id = "login",
+    data = user_base,
+    user_col = user,
+    pwd_col = password_hash,
+    sodium_hashed = TRUE,
+    cookie_logins = TRUE,
+    sessionid_col = sessionid,
+    cookie_getter = get_sessions_from_db,
+    cookie_setter = add_session_to_db,
+    log_out = reactive(logout_init())
+  )
+
+
+  onStop(function() {
+    report_files = dir(path = "www",pattern = "*.pdf", full.names = T)
+    # Exclude Composite report header
+    report_files = setdiff(report_files, "www/Composite_report_header.pdf")
+    file.remove(report_files)
+    print(report_files)
+  })
+
+
+  #########
+  #########
+  ######### Render layout login/logout
+  #########
+  #########
+
+  # call the logout module with reactive trigger to hide/show
+  logout_init <- shinyauthr::logoutServer(
+    id = "logout",
+    active = reactive(credentials()$user_auth)
+  )
+
+  user_info <- reactive({
+    credentials()$info
+  })
+
+  # Render Side bar - note doesn't need to be dynamic as not user dependent - could be though
+  output$sidebar <- renderMenu({
+    #req(credentials()$user_auth)
+    sidebarMenu(
+      id = "tabs",
+      menuItem("Results: Report Generation", tabName = "tab1"),
+      shinyjs::disable(id = 'qc_status'),
+      shinyjs::disable(id = 'scan_date'),
+      shinyjs::disable(id = 'AV'),
+      menuItem("Completed Jobs", tabName = "tab2"),
+      menuItem("Active/Queued Jobs", tabName = "tab3"),
+      menuItem("Submit a Job", tabName = "tab4"),
+      menuItem("", tabName = "tab5")
+    )
+  })
+
+
+
+  # Reveal tabs for admin
+
+
+  observeEvent(user_info()$permissions, {
+    req(user_info()$permissions == "admin")
+    shinyjs::show(selector = '[data-value="tab2"]')
+    shinyjs::show(selector = '[data-value="tab3"]')
+    shinyjs::show(selector = '[data-value="tab4"]')
+  })
+
+
+
+  # observeEvent(user_info()$illumina_Chip, {
+  #   req(credentials()$user_auth)
+  #   updateSelecInput(session,"sentrix_id",choices=  modalities[!modalities %in% c(input$ui_mod_choose2,input$ui_mod_choose3)],selected = input$ui_mod_choose1)
+  # })
+
+
+  # Control layout on login/logout
+  observeEvent(credentials()$user_auth,{
+    if (credentials()$user_auth) {
+      shinyjs::show(selector = '[data-value="tab1"]')
+      shiny::updateTabsetPanel(session, "tabs", selected = "tab1")
+      shinyjs::removeClass(selector = "body", class = "sidebar-collapse")
+    } else {
+      shiny::updateTabsetPanel(session, "tabs", selected = "tab5") # Blank tab
+      shinyjs::addClass(selector = "body", class = "sidebar-collapse")
+      shinyjs::hide(selector = '[data-value="tab1"]')
+      shinyjs::hide(selector = '[data-value="tab2"]')
+      shinyjs::hide(selector = '[data-value="tab3"]')
+      shinyjs::hide(selector = '[data-value="tab4"]')
+    }
+  })
+
+  output$welcome <- renderText({
+    req(credentials()$user_auth)
+    glue("Admin level: {user_info()$permissions}")
+  })
+
+
+  #########
+  #########
+  ######### ACTION Buttons
+  #########
+  #########
+
+
+
+  # Load job information from copy/paste box
+
+  df_products_upload <- shiny::reactive({
+    req(input$input_text!="")
+    print("Data inserted")
+    data = unlist(strsplit(unlist(strsplit(input$input_text,split="\n")),split="\t"))
+    data = tibble(Sample_ID = data[seq(1,length(data),2)],Sentrix_ID = data[seq(2,length(data),2)])
+    print(data)
+    # Do some checks
+    if (sum(substr(data$Sentrix_ID,nchar(data$Sentrix_ID)-6,nchar(data$Sentrix_ID)-6)=="_")==dim(data)[1] &
+        sum(substr(data$Sentrix_ID,nchar(data$Sentrix_ID)-5,nchar(data$Sentrix_ID)-5)=="R")==dim(data)[1] &
+        sum(substr(data$Sentrix_ID,nchar(data$Sentrix_ID)-2,nchar(data$Sentrix_ID)-2)=="C")==dim(data)[1] )
+    {
+      shinyjs::enable("submit_job")
+      updateActionButton(session, "submit_job",label = "Submit Job")
+      return(data)
+    } else {
+      showModal(modalDialog(
+        title = "Format error",
+        "Pasted data has the wrong format - double check!",
+        easyClose = TRUE,
+        footer = "Expected 2 columns in order: Sample_ID and Sentrix_ID"
+      ))
+      return(NULL)
+    }
+
+  })
+
+  # If infomration in paste box is deleted: reset submit button
+  observe({
+    req(credentials()$user_auth & input$input_text=="")
+    shinyjs::disable("submit_job")
+  })
+
+  # Submit a job
+  observe({
+    print("I am in 'Submit a job' ")
+    req(credentials()$user_auth & input$submit_job >0)
+    df = isolate(df_products_upload())
+    #check SampleIDs and SentrixIDs with regex
+    if(all(str_detect(df$"Sample_ID","^NH[0-9]+-[1-9]*")) && all(str_detect(df$"Sentrix_ID","^[0-9]*_R0[1-9]C0[1-9]")))
+    { 
+      df$Job_ID = format(Sys.time(), "%Y%m%d_%H%M%S")
+      df$User = user_info()$user
+      df$EPIC_pipeline_version= input$Epic_pipeline_version_sj
+      if(input$Epic_pipeline_version_sj != ""){
+        batches=round(dim(df)[1] / 8)
+        if(batches == 0){
+        batches=1
+        }
+      print(paste("batches",batches,sep=" "))
+      if (batches > 1){
+        sub_g=batches+1
+        d <- split(df,rep(1:sub_g,each=8))
+        for (i in 1:batches){
+          batch_job=d[[i]]
+          batch_job$Job_ID=paste(d[[i]]$Job_ID,i,sep="_b")
+          batch_job$Job_ID
+          print(file.path(submit_job_dir,paste(batch_job$Job_ID[1],".csv",sep="")))
+          write.csv(batch_job,file=file.path(submit_job_dir,paste(batch_job$Job_ID[1],".csv",sep="")),row.names = F)
+        }
+      }else{
+        print("only one batch")
+        print(df)
+        print(file.path(submit_job_dir,paste( df$Job_ID[1],".csv",sep="")))
+        write.csv(df,file=file.path(submit_job_dir,paste( df$Job_ID[1],".csv",sep="")),row.names = F)
+      }
+      shinyjs::disable("submit_job")
+      shinyjs::reset("submit_job")
+      updateActionButton(session, "submit_job",label = "Submitted")
+      updateTextInput(session, "input_text", value = "")
+      showModal(modalDialog(
+      title = "Submitted Job",
+      paste("Job ID:",df$Job_ID[1],sep=" "),
+      easyClose = TRUE,
+      footer = paste("Estimated job start time:",lubridate::ceiling_date(Sys.time(), "5 minutes"),sep=" ")))
+      }else{
+        showModal(modalDialog(
+          title = "Pipeline version needed.",
+          paste0("Illumina Pipeline version is a mandatory field. Your chooise is",input$Epic_pipeline_version_sj,'.'),
+          easyClose = TRUE,
+          footer = NULL))
+      }
+      }else{
+        showModal(modalDialog(
+          title = "Input are not correct","SampleID or Sentrix not correct",
+          easyClose = TRUE,
+          footer = NULL))
+      }
+  })
+
+  # Load queued and active jobs
+  df_job_queue <- reactive({
+    fflag = input$update_queue
+    inFiles = dir(path = active_job_dir, pattern = ".csv", full.names = T)
+    if (length(inFiles)==0)
+      return(NULL)
+    df = read.csv(inFiles[1], header = TRUE,sep = ",")
+    if (length(inFiles)>1)
+      for (f in inFiles[2:length(inFiles)]) {
+        # Make any new columns
+        new_df = read.csv(f, header = TRUE,sep = ",")
+        df=base::merge(df, new_df, all=T)
+      }
+    # Remove idat_path
+    df = df[,-which(colnames(df)=="path_to_idat")]
+    # Change completed pipelines to a single collasped column
+    summary_df = df[,match(c("Sample_ID","Sentrix_ID","Job_ID","User","Job_Status"),colnames(df))]
+    summary_df$Completed.Pipelines = ""
+    idx = grep("_Path",colnames(df))
+    pipelines = colnames(df)[idx-1]
+    if (length(idx)>0) {
+      for (i in 1:dim(summary_df)[1]) summary_df$Completed.Pipelines[i]=paste0(pipelines[which(paste0(df[i,idx-1])=="TRUE")],sep="",collapse = ";")
+    }
+    summary_df=summary_df[order(summary_df$Job_ID,decreasing = F),]
+    return(summary_df)
+  })
+
+  # Load completed jobs
+  df_job_completed <- reactive({
+    fflag_completed = input$update_complete_queue
+    if (file.exists(completed_collated_jobs)==F)
+      return(NULL)
+    df = read.csv(completed_collated_jobs, header = TRUE,sep = ",")
+    df$Completion.Date = as.Date(df$Completion.Date,format="%a %b %d %H:%M:%S %Y")
+
+    # Remove NAs - shiny doesn't like displaying them
+    df[is.na(df)]=""
+    # Extract useful information
+    df = df[,c(1:4,seq(8,dim(df)[2],2))]
+    # Change pipelines to logical
+    for (c in 5:(dim(df)[2]-1)){
+      df[df[,c]==1,c]="Completed"
+      df[df[,c]==0,c]="Failed"
+    }
+    return(df)
+  })
+
+
+  # Load Sentrix_IDs for matching Sample_IDs and Chip
+  observe({
+
+    print("I am in 'Load Sentrix_IDs for matching Sample_IDs' section")
+    req(credentials()$user_auth)
+    temp=df_completed_job()
+    v=input$sample_id
+    v2=input$Epic_pipeline_version
+    sel=temp[temp$Sample_ID == v & temp$EPIC_pipeline_version == v2,]
+    print("sel")
+    print(sel)
+    print(sel[1,13])
+    #if (length(idx)>0) {
+    if (input$sample_id !="" & input$Epic_pipeline_version !="" ){
+      print("sample and chip selected")
+      shiny::updateSelectInput(session, "sentrix_id", choices = sel[,2], selected = sel[1,2])
+      shiny::updateSelectInput(session, "scan_date", choices = sel[,14], selected = sel[1,14])
+      shiny::updateSelectInput(session, "sentrix_id", choices = sel[,2], selected = sel[1,2])
+      shiny::updateSelectInput(session, "job_id", choices =  sel[,3], selected =  sel[1,3],)
+      shiny::updateSelectInput(session, "AV", choices =  sel[,19], selected =  sel[1,19],)
+    } else {
+      #shiny::updateSelectInput(session, "sentrix_id", choices = blank_list, selected = "IlluminaEPIC_v1")
+      shiny::updateSelectInput(session, "sentrix_id", choices = sel[,2], selected = sel[1,2])
+      shiny::updateSelectInput(session, "job_id", choices = blank_list, selected = blank_list)
+    }
+     shiny::updateSelectInput(session, "pipelines", selected = input$pipelines)
+  })
+
+  #observ Info alert
+  observeEvent(input$info, {
+    # Show a modal when the button is pressed
+    shinyalert("Illumina_pipeeline_v1:", "BLABLA", type = "information")
+  })
+
+  # Load Job_IDs for matching Sample_IDs and Sentrix_IDs
+  observe({
+    req(credentials()$user_auth & input$sample_id != "" & input$sentrix_id != "")
+    print(input$sample_ID)
+    print(input$Epic_pipeline_version)
+    idx = which(df_completed_job()$Sample_ID == input$sample_ID & df_completed_job()$Sentrix_ID == input$sentrix_id & df_completed_job()$Epic_pipeline_version == input$Epic_pipeline_version)
+    if (length(idx)>0) {
+      shiny::updateSelectInput(session, "job_id", choices = df_completed_job()$Job_ID[idx], selected = df_completed_job()$Job_ID[idx[1]])
+      shiny::updateSelectInput(session, "scan_date", choices = df_completed_job()$Scan_Date_Path[idx], selected = df_completed_job()$Scan_Date_Path[idx[1]])
+      shiny::updateSelectInput(session, "qc_status", choices = df_completed_job()$QC_v1[idx], selected = df_completed_job()$QC_v1[idx[1]])
+    }
+  })
+
+
+  # Load Pipelines for Sentrix_IDs && Job_ID
+  observe({
+    print("I am in 'Load Pipelines for Sentrix_IDs && Job_ID' section")
+    req(credentials()$user_auth && !is.null(df_completed_job()))
+    if(input$Epic_pipeline_version == "EPIC_pipeline_v2"){
+      default_pipelines = c("mnp_v12b8","MEpurity_v0.1_c2")
+    }
+    #pipelines = colnames(df_completed_job())[seq(8,dim(df_completed_job())[2]-1,2)]
+    print(df_completed_job())
+    pipelines = colnames(df_completed_job()[,pipeline_index])
+    print("----------")
+    print(input$sample_id)
+    print(input$Epic_pipeline_version)
+    print("----------")
+    idx = which(df_completed_job()$Sample_ID == input$sample_id & df_completed_job()$Sentrix_ID == input$sentrix_id & df_completed_job()$Job_ID == input$job_id)
+    print(idx)
+    # Check if completed
+    pipelines=pipelines[which(df_completed_job()[idx,pipeline_index]==1 | df_completed_job()[idx,pipeline_index]=="Pass" | df_completed_job()[idx,pipeline_index]=="FAILED" | df_completed_job()[idx,pipeline_index]=="NA")]
+    print(pipelines)
+    # Remove pipelines without a report
+    pipelines=setdiff(pipelines,remove_pipelines)
+    if (length(idx)>0) {
+      shiny::updateSelectInput(session, "pipelines", choices = pipelines, selected = pipelines[1])
+      shinyjqui::updateOrderInput(session, "avaliable_reports", items = setdiff(pipelines,default_pipelines))
+      shinyjqui::updateOrderInput(session, "pipelines_to_report", items = default_pipelines)
+      shinyjs::show(id = 'report_box')
+      shinyjs::show(id = 'view_box')
+    } else {
+      shiny::updateSelectInput(session, "pipelines", choices = blank_list, selected = blank_list)
+      shinyjqui::updateOrderInput(session, "avaliable_reports", items = "")
+      shinyjqui::updateOrderInput(session, "pipelines_to_report", items = "")
+      shinyjs::hide(id = 'report_box')
+      shinyjs::hide(id = 'view_box')
+    }
+  })
+
+  # Selected pipelines for report - enable/disable buttons
+  observeEvent(input$pipelines_to_report,{
+    print("I am in 'Selected pipelines for report - enable/disable buttons' section")
+    req(credentials()$user_auth)
+    if (length(input$pipelines_to_report) > 0) {
+      shinyjs::enable("gen_report")
+    } else {
+      shinyjs::disable("gen_report")
+    }
+  }, ignoreNULL = FALSE)
+
+  # Load pipeline results
+
+  df_completed_job <- reactive({
+    fflag = input$update_pipelines
+    print("fflag")
+    print(fflag)
+    if (file.exists(completed_collated_jobs)==F)
+      return(NULL)
+    df = read.csv(completed_collated_jobs)
+    print("df")
+    print(df)
+    df=df[order(as.Date(df$Scan_Date_Path, format="%d/%m/%Y"),decreasing = T),]
+    shiny::updateSelectInput(session, "sample_id", choices = c(blank_list,df$Sample_ID), selected=blank_list)
+    print("exit from function")
+    return(df)
+  })
+
+
+  output$downloadData <- downloadHandler(
+    filename = function() {
+      req(credentials()$user_auth)
+      idx = which(df_completed_job()$Sample_ID == input$sample_id & df_completed_job()$Sentrix_ID == input$sentrix_id & df_completed_job()$Job_ID == input$job_id)
+      req(length(idx)==1)
+      filename = paste(df_completed_job()$Sample_ID[idx],
+                       "_",
+                       df_completed_job()$Sentrix_ID[idx],
+                       "_",isolate(rv$date_stamp),".pdf",sep="")
+      filename
+    },
+    content = function(file) {
+      req(credentials()$user_auth)
+      report_pipelines <- input$pipelines_to_report
+      idx = which(df_completed_job()$Sample_ID == input$sample_id & df_completed_job()$Sentrix_ID == input$sentrix_id  & df_completed_job()$Job_ID == input$job_id)
+      req(length(idx)==1)
+      # build paths to pdfs
+      pdf_list = vector(mode="character")
+      pdf_list[1] = "www/Composite_report_header.pdf"
+      i=2
+      for (report in report_pipelines) {
+        col_idx = which(colnames(df_completed_job())==paste(report,"_Path",sep=""))
+        path_to_report = df_completed_job()[idx,col_idx]
+        filename = paste(df_completed_job()$Sample_ID[idx],
+                         "_",
+                         df_completed_job()$Sentrix_ID[idx],
+                         "_",
+                         report,
+                         "_report.pdf",sep="")
+        pdf_list[i] = file.path(classifier_reports_dirs[report],
+                                path_to_report,
+                                filename)
+        i=i+1
+      }
+      keep_record = file.path(report_record_dir,paste(df_completed_job()$Sample_ID[idx],
+                                                      "_",
+                                                      df_completed_job()$Sentrix_ID[idx],
+                                                      "_",isolate(rv$date_stamp),".pdf",sep=""))
+      pdf_combine(pdf_list, keep_record)
+      pdf_combine(pdf_list,file)
+
+    }
+  )
+
+
+  restab <- eventReactive(input$nzconnect,{
+    print("in 'eventReactive' section")
+    req(credentials()$user_auth & input$sample_id != "")
+    print(paste0("window.open('https://nzconnect.ion.ucl.ac.uk/nz/connect/view?in=&for=",input$sample_id,"&subfolders=true&and=true', '1_blank')",sep=""))
+    tags$script(HTML(paste0("window.open('https://nzconnect.ion.ucl.ac.uk/nz/connect/view?in=&for=",input$sample_id,"&subfolders=true&and=true', '1_blank')",sep="")))
+
+  })
+  output$ui_open_tab <- renderUI(restab())
+
+  #########
+  #########
+  ######### RENDER UIs
+  #########
+  #########
+
+  # Review results
+
+  observeEvent(input$pipelines, {
+    output$pdfview <- renderUI({
+      idx = which(df_completed_job()$Sample_ID == input$sample_id & df_completed_job()$Sentrix_ID == input$sentrix_id & df_completed_job()$Job_ID == input$job_id)
+      print("idx")
+      print(idx)
+      req(credentials()$user_auth & length(idx)==1)
+      print("*")
+      print(input$pipelines)
+      print("*")
+      col_idx = which(colnames(df_completed_job())==paste(input$pipelines,"_Path",sep=""))
+      path_to_report = df_completed_job()[idx,col_idx]
+      print(path_to_report)
+      filename = paste(df_completed_job()$Sample_ID[idx],
+                       "_",
+                       df_completed_job()$Sentrix_ID[idx],
+                       "_",
+                       input$pipelines,
+                       "_report.pdf",sep="")
+      # Report must be local and in www folder
+      local_file_path = file.path(classifier_reports_dirs[input$pipelines],
+                                  path_to_report,
+                                  filename)
+      print("filePath")
+      print(paste(classifier_reports_dirs[input$pipelines],
+                  path_to_report,
+                  filename,sep="/"))
+      if (file.exists(file.path("www",filename)))
+        file.remove(file.path("www",filename))
+      if (file.exists(local_file_path)){
+        file.copy(local_file_path,file.path("www",filename))
+      }
+      tags$iframe(style="height:2000px; width:98%",scrolling="auto", src= filename) #view=FitH
+    })
+  })
+
+  # Display completed jobs - tab 2
+  output$tab2_ui <- renderUI({
+    req(credentials()$user_auth & user_info()$permissions == "admin")
+    fluidRow(
+      column(
+        width = 12,
+        tags$h4(glue("Completed Pipelines.")),
+        box(
+          width = NULL,
+          status = "primary",
+          DT::renderDT(datatable(df_job_completed(),rownames = F, class = c("compact","order-column"),
+                                 options = list(order = list(dim(df_job_completed())[2]-1, 'desc'),
+                                                scrollX = TRUE,
+                                                pageLength = 10,
+                                                autoWidth = F),
+                                 selection="none"))
+        )
+      )
+    )
+  })
+
+
+  # Display queued jobs
+  output$tab3_ui <- renderUI({
+    req(credentials()$user_auth & user_info()$permissions == "admin")
+    fluidRow(
+      column(
+        width = 12,
+        tags$h4(glue("Active and queued jobs.")),
+        box(
+          width = NULL,
+          status = "primary",
+          DT::renderDT(datatable(df_job_queue(),rownames = F, class = c("compact","order-column"),
+                                 options = list(scrollX = TRUE,
+                                                pageLength = 10,
+                                                autoWidth = F),
+                                 selection="none"))
+        )
+      )
+    )
+  })
+
+  # Submit jobs tab
+  output$tab4_ui <- renderUI({
+    req(credentials()$user_auth & user_info()$permissions == "admin")
+    fluidRow(
+      column(
+        width = 12,
+        # tags$h2(glue("")),
+        box(
+          width = NULL,
+          status = "primary",
+          DT::renderDT(df_products_upload(), options = list(scrollX = TRUE,pageLength = 8, autoWidth = F), rownames= FALSE, selection="none")
+        )
+      )
+    )
+  })
+
+
+
+}
+
+shiny::shinyApp(ui, server)
